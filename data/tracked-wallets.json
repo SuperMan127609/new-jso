@@ -1,0 +1,32 @@
+[
+  {
+    "trackedWalletAddress": "66W4ypeod8MegVzMot5ZJPEh6QBUG4FriDxC72bEJxvT",
+    "name": "pow alt",
+    "emoji": "💲",
+    "alertsOnToast": true,
+    "alertsOnBubble": true,
+    "alertsOnFeed": true,
+    "groups": ["Main"],
+    "sound": "default"
+  },
+  {
+    "trackedWalletAddress": "VJSDW6S74YXR4rRR9P4xwhMvLZJQMhrUb8XMFirUsy1",
+    "name": "eurpe 113k",
+    "emoji": "👻",
+    "alertsOnToast": true,
+    "alertsOnBubble": true,
+    "alertsOnFeed": true,
+    "groups": ["Main"],
+    "sound": "default"
+  },
+  {
+    "trackedWalletAddress": "5rFwZ6uKBziJWYjkPrWWLfjGPtoAdzFj1QLvm5cpFsuN",
+    "name": "cooker3",
+    "emoji": "👨‍🍳",
+    "alertsOnToast": true,
+    "alertsOnBubble": true,
+    "alertsOnFeed": true,
+    "groups": ["Main"],
+    "sound": "default"
+  }
+]
