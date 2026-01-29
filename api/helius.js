@@ -1,38 +1,42 @@
-// api/helius.js (CommonJS for Vercel Node runtime)
-
+// api/helius.js
 const fs = require("fs");
 const path = require("path");
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-const HELIUS_AUTH_HEADER = process.env.HELIUS_AUTH_HEADER; // optional
+const HELIUS_AUTH_HEADER = process.env.HELIUS_AUTH_HEADER; // optional (exact match)
+const WALLETS_FILE = process.env.WALLETS_FILE || "tracked-wallets.json";
+
+// Cache wallets between invocations (Vercel may reuse the same runtime)
+let WALLET_CACHE = null;
+let WALLET_CACHE_AT = 0;
+const CACHE_MS = 60_000;
 
 function shortAddr(a) {
   if (!a || a.length < 10) return a || "";
   return `${a.slice(0, 4)}…${a.slice(-4)}`;
 }
 
-// ---- Wallet cache (avoids re-reading file on every request) ----
-let WALLET_CACHE = null;
-let WALLET_CACHE_MTIME = 0;
+function resolveWalletPath() {
+  // Expected: /data/tracked-wallets.json at repo root
+  return path.join(process.cwd(), "data", WALLETS_FILE);
+}
 
-function loadWalletsCached() {
-  const p = path.join(process.cwd(), "data", "tracked-wallets.json");
+function loadWallets() {
+  const now = Date.now();
+  if (WALLET_CACHE && now - WALLET_CACHE_AT < CACHE_MS) return WALLET_CACHE;
 
+  const p = resolveWalletPath();
   if (!fs.existsSync(p)) {
-    throw new Error(`Missing wallets file: ${p}`);
+    throw new Error(
+      `Wallet file not found at ${p}. Make sure you have /data/${WALLETS_FILE} committed in GitHub.`
+    );
   }
-
-  const stat = fs.statSync(p);
-  const mtime = stat.mtimeMs;
-
-  // Only reload when file changes
-  if (WALLET_CACHE && WALLET_CACHE_MTIME === mtime) return WALLET_CACHE;
 
   const raw = fs.readFileSync(p, "utf8");
   const arr = JSON.parse(raw);
 
   if (!Array.isArray(arr)) {
-    throw new Error("tracked-wallets.json must be a JSON array of wallet objects.");
+    throw new Error(`Wallet file must be a JSON array. Got: ${typeof arr}`);
   }
 
   const map = new Map();
@@ -42,14 +46,42 @@ function loadWalletsCached() {
   }
 
   WALLET_CACHE = { list: arr, map, set: new Set(map.keys()) };
-  WALLET_CACHE_MTIME = mtime;
+  WALLET_CACHE_AT = now;
   return WALLET_CACHE;
 }
 
-async function postToDiscord(content) {
-  if (!DISCORD_WEBHOOK_URL) return;
+async function readRawBody(req) {
+  // If Vercel already parsed JSON:
+  if (req.body && typeof req.body === "object") return req.body;
 
-  // Node 18+ on Vercel has fetch globally.
+  // If body is a string:
+  if (typeof req.body === "string") {
+    try {
+      return JSON.parse(req.body);
+    } catch {
+      return req.body;
+    }
+  }
+
+  // Otherwise read stream
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (!text) return null;
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+async function postToDiscord(content) {
+  if (!DISCORD_WEBHOOK_URL) {
+    console.warn("DISCORD_WEBHOOK_URL missing. Skipping Discord post.");
+    return;
+  }
+
   const resp = await fetch(DISCORD_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -62,27 +94,19 @@ async function postToDiscord(content) {
   }
 }
 
-// Try multiple common locations where the “wallet address” might appear.
-// Helius payloads can vary depending on webhook type and config.
-function extractLikelyWallet(e) {
-  // Most common in enhanced webhooks:
-  const candidates = [
-    e?.feePayer,
-    e?.account,
-    e?.wallet,
-    e?.owner,
-    e?.source,
-    e?.transaction?.message?.accountKeys?.[0], // sometimes fee payer is first account key
-    e?.accountData?.[0]?.account,
-    e?.nativeTransfers?.[0]?.fromUserAccount,
-    e?.nativeTransfers?.[0]?.toUserAccount,
-  ].filter(Boolean);
+function extractLikelyWalletFromEvent(e) {
+  // Helius often includes feePayer at top-level
+  if (e?.feePayer) return e.feePayer;
 
-  return candidates[0] || "";
-}
+  // Some payloads include accountData array
+  const account = e?.accountData?.[0]?.account;
+  if (account) return account;
 
-function extractSignature(e) {
-  return e?.signature || e?.transactionSignature || e?.transaction?.signatures?.[0] || "n/a";
+  // Sometimes it’s nested
+  const nested = e?.transaction?.message?.accountKeys?.[0];
+  if (nested) return nested;
+
+  return "";
 }
 
 module.exports = async (req, res) => {
@@ -91,39 +115,38 @@ module.exports = async (req, res) => {
     if (req.method === "GET") return res.status(200).send("ok");
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // Optional auth check (only if you set HELIUS_AUTH_HEADER)
+    // Optional auth check (Helius can send Authorization header)
     if (HELIUS_AUTH_HEADER) {
-      const got = req.headers?.authorization;
+      const got = req.headers.authorization || "";
       if (got !== HELIUS_AUTH_HEADER) return res.status(401).send("Unauthorized");
     }
 
-    const { map, set } = loadWalletsCached();
+    const { map, set } = loadWallets();
 
-    // Vercel may give req.body as already-parsed object, or as a string
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const body = await readRawBody(req);
+    const events = Array.isArray(body) ? body : body ? [body] : [];
 
-    // Helius can send a single object or an array of objects
-    const events = Array.isArray(body) ? body : [body];
+    if (!events.length) {
+      console.warn("No events in webhook body.");
+      return res.status(200).send("ok");
+    }
 
     for (const e of events) {
       const type = e?.type || "UNKNOWN";
-
-      // If you ONLY want SWAP events, keep this.
-      // If you want to test quickly, temporarily comment it out.
       if (type !== "SWAP") continue;
 
-      const sig = extractSignature(e);
-      const likelyWallet = extractLikelyWallet(e);
+      const sig = e?.signature || e?.transactionSignature || "n/a";
+      const wallet = extractLikelyWalletFromEvent(e);
 
-      // Only alert if this tx is from a tracked wallet
-      if (!set.has(likelyWallet)) continue;
+      // Only alert if tx is from a tracked wallet
+      if (!wallet || !set.has(wallet)) continue;
 
-      const w = map.get(likelyWallet);
+      const w = map.get(wallet);
       const solscan = sig !== "n/a" ? `https://solscan.io/tx/${sig}` : "";
 
       const msg =
         `${w?.emoji || "🟣"} **Tracked SWAP detected**\n` +
-        `• **Wallet:** ${w?.name || "Unnamed"} (\`${shortAddr(likelyWallet)}\`)\n` +
+        `• **Wallet:** ${w?.name || "Unnamed"} (\`${shortAddr(wallet)}\`)\n` +
         `• **Tx:** ${solscan}`;
 
       await postToDiscord(msg);
