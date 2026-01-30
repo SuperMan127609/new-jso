@@ -1,25 +1,31 @@
+// api/helius.js
 const fs = require("fs");
 const path = require("path");
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
-const HELIUS_AUTH_HEADER = process.env.HELIUS_AUTH_HEADER || ""; // optional
+const HELIUS_AUTH_HEADER = process.env.HELIUS_AUTH_HEADER || "";
 
-// Flood controls (safe defaults)
-const COOLDOWN_SECONDS = Number(process.env.COOLDOWN_SECONDS || "60"); // per-wallet cooldown
-const MAX_ALERTS_PER_REQUEST = Number(process.env.MAX_ALERTS_PER_REQUEST || "5");
+// --------- Filters / flood control (set in Vercel env vars) ----------
+const MIN_SOL = Number(process.env.MIN_SOL || "1.5");             // trigger A
+const MIN_STABLE = Number(process.env.MIN_STABLE || "250");       // trigger B
+const COOLDOWN_SECONDS = Number(process.env.COOLDOWN_SECONDS || "300");
+const MAX_ALERTS_PER_REQUEST = Number(process.env.MAX_ALERTS_PER_REQUEST || "3");
+const ALERT_TYPES = (process.env.ALERT_TYPES || "SWAP")
+  .split(",")
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean);
 
-// Filtering thresholds (set to 0 to disable)
-const MIN_SOL = Number(process.env.MIN_SOL || "0");        // 0 = disabled
-const MIN_STABLE = Number(process.env.MIN_STABLE || "0");  // 0 = disabled
 const STABLE_MINTS = new Set(
   (process.env.STABLE_MINTS ||
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" // USDC
+    // USDC (default)
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
   )
     .split(",")
     .map(s => s.trim())
     .filter(Boolean)
 );
 
+// --------- helpers ----------
 function shortAddr(a) {
   if (!a || a.length < 10) return a || "";
   return `${a.slice(0, 4)}…${a.slice(-4)}`;
@@ -29,10 +35,10 @@ function getWalletFilePath() {
   return path.join(process.cwd(), "data", "tracked-wallets.json");
 }
 
-// Cache wallets on warm invocations
-let cached = null;
+// cache wallet list on warm invocations
+let cachedWallets = null;
 function loadWalletsCached() {
-  if (cached) return cached;
+  if (cachedWallets) return cachedWallets;
 
   const filePath = getWalletFilePath();
   if (!fs.existsSync(filePath)) {
@@ -49,8 +55,8 @@ function loadWalletsCached() {
     if (w?.trackedWalletAddress) map.set(w.trackedWalletAddress, w);
   }
 
-  cached = { list, map, set: new Set(map.keys()) };
-  return cached;
+  cachedWallets = { list, map, set: new Set(map.keys()) };
+  return cachedWallets;
 }
 
 async function postToDiscord(payload) {
@@ -84,7 +90,7 @@ function extractFeePayer(e) {
   );
 }
 
-// Best-effort net SOL for wallet (may be missing in some payloads)
+// Best-effort net SOL movement for the wallet from nativeTransfers (lamports)
 function computeNetSol(e, wallet) {
   const nativeTransfers = Array.isArray(e?.nativeTransfers) ? e.nativeTransfers : [];
   let lamports = 0;
@@ -102,7 +108,7 @@ function computeNetSol(e, wallet) {
   return lamports / 1_000_000_000;
 }
 
-// Best-effort net stable (USDC etc.) for wallet
+// Best-effort net stable (USDC/USDT) from tokenTransfers
 function computeNetStable(e, wallet) {
   const tokenTransfers = Array.isArray(e?.tokenTransfers) ? e.tokenTransfers : [];
   let net = 0;
@@ -149,7 +155,7 @@ function summarizeTokenLegs(e, wallet) {
   return { biggestIn, biggestOut };
 }
 
-// Cooldown memory (best effort)
+// cooldown in-memory (best effort)
 const lastAlertAt = new Map();
 function nowSec() {
   return Math.floor(Date.now() / 1000);
@@ -164,16 +170,11 @@ function markAlert(wallet) {
 }
 
 module.exports = async (req, res) => {
-  let received = 0;
-  let swaps = 0;
-  let tracked = 0;
-  let alerted = 0;
-
   try {
     if (req.method === "GET") return res.status(200).send("ok");
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // Optional auth
+    // optional auth
     if (HELIUS_AUTH_HEADER) {
       const got = req.headers.authorization || "";
       if (got !== HELIUS_AUTH_HEADER) return res.status(401).send("Unauthorized");
@@ -184,26 +185,26 @@ module.exports = async (req, res) => {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const events = Array.isArray(body) ? body : [body];
 
-    received = events.length;
+    let sent = 0;
 
     for (const e of events) {
       const type = String(e?.type || "UNKNOWN").toUpperCase();
-      if (type !== "SWAP") continue;
-      swaps++;
+      if (!ALERT_TYPES.includes(type)) continue;
 
       const feePayer = extractFeePayer(e);
       if (!feePayer || !set.has(feePayer)) continue;
-      tracked++;
 
       if (isCoolingDown(feePayer)) continue;
 
-      // Thresholds (only apply if you set them > 0)
       const netSol = computeNetSol(e, feePayer);
       const netStable = computeNetStable(e, feePayer);
-      const passesSol = MIN_SOL > 0 ? Math.abs(netSol) >= MIN_SOL : true;
-      const passesStable = MIN_STABLE > 0 ? Math.abs(netStable) >= MIN_STABLE : true;
 
-      if (!passesSol || !passesStable) continue;
+      // IMPORTANT: useful trigger is OR (either SOL size OR stable size)
+      const triggersSol = MIN_SOL > 0 ? Math.abs(netSol) >= MIN_SOL : false;
+      const triggersStable = MIN_STABLE > 0 ? Math.abs(netStable) >= MIN_STABLE : false;
+
+      // if you set both thresholds to 0 (not recommended), it would alert nothing:
+      if (!triggersSol && !triggersStable) continue;
 
       const w = map.get(feePayer);
       const sig = extractSignature(e);
@@ -211,14 +212,18 @@ module.exports = async (req, res) => {
 
       const { biggestIn, biggestOut } = summarizeTokenLegs(e, feePayer);
 
+      const action =
+        netSol < 0 ? "BUY (spent SOL)" :
+        netSol > 0 ? "SELL (received SOL)" :
+        "SWAP";
+
       const embed = {
-        title: `${w?.emoji || "🟣"} Tracked SWAP`,
+        title: `${w?.emoji || "🟣"} ${w?.name || "Tracked Wallet"} • ${action}`,
         url: solscan,
-        description: `**${w?.name || "Unnamed"}** (\`${shortAddr(feePayer)}\`)`,
+        description: `Wallet: \`${shortAddr(feePayer)}\``,
         fields: [
           { name: "Net SOL", value: `${netSol >= 0 ? "+" : ""}${netSol.toFixed(4)} SOL`, inline: true },
           { name: "Net Stable", value: `${netStable >= 0 ? "+" : ""}${netStable.toFixed(2)}`, inline: true },
-          { name: "Tx", value: solscan ? solscan : "n/a", inline: false },
           {
             name: "Largest Token In",
             value: biggestIn ? `+${biggestIn.amt}\n\`${shortAddr(biggestIn.mint)}\`` : "n/a",
@@ -230,7 +235,9 @@ module.exports = async (req, res) => {
             inline: true,
           },
         ],
-        footer: { text: "BitDuel Wallet Tracker • Helius" },
+        footer: {
+          text: `BitDuel Wallet Tracker • cooldown=${COOLDOWN_SECONDS}s • minSOL=${MIN_SOL} • minStable=${MIN_STABLE}`,
+        },
         timestamp: new Date().toISOString(),
       };
 
@@ -240,18 +247,14 @@ module.exports = async (req, res) => {
       });
 
       markAlert(feePayer);
-      alerted++;
+      sent++;
 
-      if (alerted >= MAX_ALERTS_PER_REQUEST) break;
+      if (sent >= MAX_ALERTS_PER_REQUEST) break;
     }
 
-    return res.status(200).send(
-      `ok | received=${received} swaps=${swaps} tracked=${tracked} alerted=${alerted}`
-    );
+    return res.status(200).send(`ok (${sent} alerts sent)`);
   } catch (err) {
     console.error("Webhook error:", err);
-    return res.status(500).send(
-      `error | received=${received} swaps=${swaps} tracked=${tracked} alerted=${alerted}`
-    );
+    return res.status(500).send("error");
   }
 };
