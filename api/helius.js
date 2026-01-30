@@ -43,6 +43,22 @@ function shortAddr(a) {
   return `${a.slice(0, 4)}…${a.slice(-4)}`;
 }
 
+function fmtSigned(n, decimals = 4) {
+  const num = Number(n || 0);
+  const sign = num > 0 ? "+" : "";
+  return `${sign}${num.toFixed(decimals)}`;
+}
+
+function solscanTx(sig) {
+  return sig && sig !== "n/a" ? `https://solscan.io/tx/${sig}` : "";
+}
+function solscanAddr(addr) {
+  return addr ? `https://solscan.io/account/${addr}` : "";
+}
+function solscanToken(mint) {
+  return mint ? `https://solscan.io/token/${mint}` : "";
+}
+
 function getWalletFilePath() {
   return path.join(process.cwd(), "data", "tracked-wallets.json");
 }
@@ -65,6 +81,7 @@ function loadWalletsCached() {
 
   const map = new Map();
   for (const w of list) {
+    // Your current schema uses trackedWalletAddress
     if (w?.trackedWalletAddress) map.set(w.trackedWalletAddress, w);
   }
 
@@ -188,7 +205,7 @@ function scoreEvent({ netSol, netStable, biggestIn, biggestOut }) {
   if (u >= 250) score += 3;
   if (u >= 1000) score += 5;
 
-  // Big token legs (often memecoins have huge counts; still useful as a “size” proxy)
+  // Big token legs
   const inAmt = Math.abs(Number(biggestIn?.amt || 0));
   const outAmt = Math.abs(Number(biggestOut?.amt || 0));
   const leg = Math.max(inAmt, outAmt);
@@ -212,6 +229,104 @@ function isCoolingDown(wallet) {
 }
 function markAlert(wallet) {
   lastAlertAt.set(wallet, nowSec());
+}
+
+/**
+ * Telegram-style embed: tight, readable, link-forward.
+ * Picks a “main token” (in for buys, out for sells) so the alert feels like a signal post.
+ */
+function buildTelegramStyleEmbed({
+  walletObj,
+  feePayer,
+  actionLabel, // "BUY" | "SELL" | "SWAP"
+  netSol,
+  netStable,
+  biggestIn,
+  biggestOut,
+  score,
+  signature,
+}) {
+  const txUrl = solscanTx(signature);
+  const walletUrl = solscanAddr(feePayer);
+
+  // Choose a “main” token to feature in title/fields (best guess)
+  const mainToken =
+    actionLabel === "BUY" ? biggestIn :
+    actionLabel === "SELL" ? biggestOut :
+    (biggestIn?.amt || 0) >= (biggestOut?.amt || 0) ? biggestIn : biggestOut;
+
+  const tokenMint = mainToken?.mint || "";
+  const tokenAmt = mainToken?.amt ?? null;
+  const tokenUrl = tokenMint ? solscanToken(tokenMint) : "";
+
+  // Color hint (green/red/purple)
+  const color =
+    actionLabel === "BUY" ? 0x2ecc71 :
+    actionLabel === "SELL" ? 0xe74c3c :
+    0x8e44ad;
+
+  const walletName = walletObj?.name || "Tracked Wallet";
+  const walletEmoji = walletObj?.emoji || "🟣";
+
+  // Title: like Telegram signal headers
+  const titleToken = tokenMint ? shortAddr(tokenMint) : "TOKEN";
+  const title = `${actionLabel === "BUY" ? "🟢" : actionLabel === "SELL" ? "🔴" : "🟣"} ${actionLabel} • ${titleToken}`;
+
+  const lines = [
+    `**Wallet:** [${walletName}](${walletUrl}) \`${shortAddr(feePayer)}\``,
+    txUrl ? `**Tx:** [View on Solscan](${txUrl})` : `**Tx:** n/a`,
+  ];
+
+  // Fields in a Telegram-ish block style
+  const fields = [];
+
+  // Main token block
+  if (tokenMint) {
+    fields.push({
+      name: "Token",
+      value: `${tokenUrl ? `[${shortAddr(tokenMint)}](${tokenUrl})` : `\`${shortAddr(tokenMint)}\``}`,
+      inline: false,
+    });
+  }
+
+  if (tokenAmt !== null) {
+    fields.push({
+      name: "Size",
+      value: `**${Number(tokenAmt).toLocaleString()}** tokens`,
+      inline: true,
+    });
+  }
+
+  fields.push({
+    name: "Net SOL",
+    value: `**${fmtSigned(netSol, 4)} SOL**`,
+    inline: true,
+  });
+
+  fields.push({
+    name: "Net Stable",
+    value: `**${fmtSigned(netStable, 2)}** (USDC/USDT)`,
+    inline: true,
+  });
+
+  // Keep these, but make them cleaner
+  fields.push({
+    name: "Top In / Out",
+    value:
+      `**IN:** ${biggestIn ? `+${Number(biggestIn.amt).toLocaleString()} \`${shortAddr(biggestIn.mint)}\`` : "n/a"}\n` +
+      `**OUT:** ${biggestOut ? `-${Number(biggestOut.amt).toLocaleString()} \`${shortAddr(biggestOut.mint)}\`` : "n/a"}`,
+    inline: false,
+  });
+
+  return {
+    title,
+    url: txUrl || undefined,
+    color,
+    description: lines.join("\n"),
+    fields,
+    footer: { text: `${walletEmoji} BitDuel Tracker • Signal Score: ${score}` },
+    timestamp: new Date().toISOString(),
+  };
 }
 
 // ----------------- HANDLER -----------------
@@ -257,30 +372,27 @@ module.exports = async (req, res) => {
       const netStable = computeNetStable(e, feePayer);
       const { biggestIn, biggestOut } = summarizeTokenLegs(e, feePayer);
 
-      // Triggers (OR): let more through, then rely on cooldown + max per batch
-      const triggersSol = MIN_SOL > 0 ? Math.abs(netSol) >= MIN_SOL : true; // default true if MIN_SOL=0
-      const triggersStable = MIN_STABLE > 0 ? Math.abs(netStable) >= MIN_STABLE : true; // default true if MIN_STABLE=0
+      // Triggers (OR)
+      const triggersSol = MIN_SOL > 0 ? Math.abs(netSol) >= MIN_SOL : true;
+      const triggersStable = MIN_STABLE > 0 ? Math.abs(netStable) >= MIN_STABLE : true;
 
       const biggestLeg = Math.max(
         Math.abs(Number(biggestIn?.amt || 0)),
         Math.abs(Number(biggestOut?.amt || 0))
       );
-      const triggersTokenLeg = MIN_TOKEN_LEG > 0 ? biggestLeg >= MIN_TOKEN_LEG : true; // default true if 0
+      const triggersTokenLeg = MIN_TOKEN_LEG > 0 ? biggestLeg >= MIN_TOKEN_LEG : true;
 
-      // To avoid “no alerts” situations, we only filter out if ALL are false
       if (!triggersSol && !triggersStable && !triggersTokenLeg) {
         filtered++;
         continue;
       }
 
       const sig = extractSignature(e);
-      const solscan = sig !== "n/a" ? `https://solscan.io/tx/${sig}` : undefined;
-
       const w = map.get(feePayer);
 
-      // Heuristic BUY/SELL label
-      const action =
-        netSol < 0 ? "BUY (spent SOL)" : netSol > 0 ? "SELL (received SOL)" : "SWAP";
+      // Clean BUY/SELL label (keeps your previous meaning)
+      const actionLabel =
+        netSol < 0 ? "BUY" : netSol > 0 ? "SELL" : "SWAP";
 
       const score = scoreEvent({ netSol, netStable, biggestIn, biggestOut });
 
@@ -288,41 +400,17 @@ module.exports = async (req, res) => {
       const ping =
         PING_ROLE_ID && score >= PING_SCORE ? `<@&${PING_ROLE_ID}> ` : "";
 
-      const embed = {
-        title: `${w?.emoji || "🟣"} ${w?.name || "Tracked Wallet"} • ${action}`,
-        url: solscan,
-        description: `Wallet: \`${shortAddr(feePayer)}\` • **Signal Score:** ${score}`,
-        fields: [
-          {
-            name: "Spent/Received SOL (net)",
-            value: `${netSol >= 0 ? "+" : ""}${netSol.toFixed(4)} SOL`,
-            inline: true,
-          },
-          {
-            name: "Spent/Received Stable (net)",
-            value: `${netStable >= 0 ? "+" : ""}${netStable.toFixed(2)} (USDC/USDT)`,
-            inline: true,
-          },
-          {
-            name: "Top Token In",
-            value: biggestIn
-              ? `+${Number(biggestIn.amt).toLocaleString()}\n\`${shortAddr(biggestIn.mint)}\``
-              : "n/a",
-            inline: true,
-          },
-          {
-            name: "Top Token Out",
-            value: biggestOut
-              ? `-${Number(biggestOut.amt).toLocaleString()}\n\`${shortAddr(biggestOut.mint)}\``
-              : "n/a",
-            inline: true,
-          },
-        ],
-        footer: {
-          text: `BitDuel Wallet Tracker • cooldown=${COOLDOWN_SECONDS}s • minSOL=${MIN_SOL} • minStable=${MIN_STABLE} • minTokenLeg=${MIN_TOKEN_LEG}`,
-        },
-        timestamp: new Date().toISOString(),
-      };
+      const embed = buildTelegramStyleEmbed({
+        walletObj: w,
+        feePayer,
+        actionLabel,
+        netSol,
+        netStable,
+        biggestIn,
+        biggestOut,
+        score,
+        signature: sig,
+      });
 
       if (DEBUG) {
         console.log("Alert", {
