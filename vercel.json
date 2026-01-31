@@ -1,0 +1,5 @@
+{
+  "crons": [
+    { "path": "/api/big-moves", "schedule": "*/15 * * * *" }
+  ]
+}
